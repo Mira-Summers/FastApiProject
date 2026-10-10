@@ -99,6 +99,10 @@ class Settings:
     # --- Helm ---
     helm_binary: str = "helm"
     helm_timeout_seconds: int = 120
+    # 是否把父进程的 KUBECONFIG 传给 helm 子进程。默认不传：KUBECONFIG 会把 helm
+    # 指到另一个集群，导致「读 Pod 用的集群」和「回滚打的集群」不是同一个。
+    # 仅在本地开发需要指向 kind 之类的场景才打开。
+    helm_inherit_kubeconfig: bool = False
 
     # --- 认证 ---
     # tokenreview: 调集群 TokenReview 校验调用方身份（推荐，生产必须）
@@ -159,6 +163,7 @@ class Settings:
             helm_timeout_seconds=_read_int(
                 source, "HELM_TIMEOUT_SECONDS", 120, minimum=1, maximum=3600
             ),
+            helm_inherit_kubeconfig=_read_bool(source, "HELM_INHERIT_KUBECONFIG", False),
             auth_mode=_read_str(source, "AUTH_MODE", cls.auth_mode).lower(),
             auth_audience=_read_str(source, "AUTH_AUDIENCE", cls.auth_audience),
             auth_cache_ttl_seconds=_read_int(

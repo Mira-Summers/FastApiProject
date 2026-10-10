@@ -2,3 +2,6 @@ fastapi==0.104.1
 uvicorn==0.24.0
 kubernetes==28.1.0
 pydantic==2.5.2
+# 纯 Python、零依赖。手写 exposition 格式要自己维护直方图分桶和计数器持久化，
+# 换来的收益几乎为零。
+prometheus_client==0.21.1

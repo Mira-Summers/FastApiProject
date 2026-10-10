@@ -1,11 +1,64 @@
-# Test your FastAPI endpoints
+# K8s 运维助手 —— 接口速查
+#
+# 启动：.venv312\Scripts\uvicorn main:app --reload
+# Phase 3 之后所有 /api/v1/* 接口都需要带 Authorization 头：
+#   kubectl create token ops-api -n k8s-ops-api --audience=k8s-ops-api
+#   并把下面的 {{token}} 换成实际值。
 
+### 存活探针：不触碰集群，进程活着就返回 200
+# 刻意不依赖 k8s：集群抖动时不能让 kubelet 杀掉健康的 Pod
+GET http://127.0.0.1:8000/health/live
+
+### 就绪探针：真打一次 API Server（结果缓存 5 秒，失败也缓存）
+# 集群不可达时返回 503；本地没有集群时这里就是 503
+GET http://127.0.0.1:8000/health/ready
+
+### Prometheus 指标（免认证，靠 NetworkPolicy 收在集群内）
+GET http://127.0.0.1:8000/metrics
+
+### 服务元信息
 GET http://127.0.0.1:8000/
-Accept: application/json
 
-###
+### 列出 default 命名空间下的 Pod
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods
 
-GET http://127.0.0.1:8000/hello/User
-Accept: application/json
+### 按标签与阶段过滤（运维最常用）
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods?label_selector=app%3Dweb&field_selector=status.phase%3DRunning
 
-###
+### 只关心出问题的 Pod：按重启次数排序看
+GET http://127.0.0.1:8000/api/v1/namespaces/kube-system/pods?field_selector=status.phase%3DRunning
+
+### 单个 Pod 详情（含容器状态、上次终止原因与退出码）
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123
+
+### 读取日志末尾 100 行
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123/logs?tail_lines=100
+
+### CrashLoopBackOff 排障：读上一个已终止容器的日志
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123/logs?previous=true&container=app&tail_lines=200
+
+### 只取最近 10 分钟的日志并带时间戳
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123/logs?since_seconds=600&timestamps=true
+
+### 查询 Helm release 的版本历史
+GET http://127.0.0.1:8000/api/v1/namespaces/default/helm/releases/web/history
+
+### 回滚到指定版本（必须显式 confirm，否则 400）
+# 无论成功失败都会写审计：先记 attempted，再记 succeeded/failed。
+# 带 X-Request-ID 可以把审计、访问日志、错误响应串成一条线。
+POST http://127.0.0.1:8000/api/v1/namespaces/default/helm/releases/web/rollback
+Content-Type: application/json
+X-Request-ID: trace-rollback-001
+
+{
+  "revision": 3,
+  "confirm": true
+}
+
+### 回滚到上一个版本（不传 revision）
+POST http://127.0.0.1:8000/api/v1/namespaces/default/helm/releases/web/rollback
+Content-Type: application/json
+
+{
+  "confirm": true
+}

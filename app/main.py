@@ -9,19 +9,30 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, Request, Response
 
-from app.api.routes import health
+from app.api.routes import health, helm, logs, pods
+from app.api.routes import metrics as metrics_routes
+from app.audit import AuditLogger
 from app.config import Settings, get_settings
+from app.errors import register_exception_handlers
+from app.k8s.readiness import ReadinessProbe
 from app.logging_setup import (
     configure_logging,
     get_request_id,
     reset_request_id,
     sanitize_request_id,
     set_request_id,
+)
+from app.metrics import (
+    is_metered_route,
+    is_scrape,
+    observe_request,
+    route_template,
+    track_in_progress,
 )
 
 logger = logging.getLogger("app.request")
@@ -92,6 +103,39 @@ def _register_request_context(app: FastAPI) -> None:
             reset_request_id(token)
 
 
+def _register_metrics(app: FastAPI) -> None:
+    """HTTP 指标。刻意注册在请求上下文中间件之后，从而位于最外层。
+
+    Starlette 的 `add_middleware` 是 insert(0)，后注册的在更外层。放最外层意味着
+    这个中间件度量的是调用方真实感受到的端到端耗时，也意味着它能看到
+    内层任何中间的异常。
+    """
+
+    @app.middleware("http")
+    async def metrics_middleware(request: Request, call_next) -> Response:
+        method = request.method
+        started = time.perf_counter()
+        # 先按 500 记账：call_next 抛异常时下面的 finally 会按这个值记录。
+        status_code = 500
+        # 抓取请求不计入在途数，否则 gauge 永远读到 1（详见 app.metrics.is_scrape）。
+        tracker = nullcontext() if is_scrape(request.url.path) else track_in_progress(method)
+        try:
+            with tracker:
+                response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            # 路由模板要等 call_next 返回后才写进 scope，所以只能在这里读。
+            route = route_template(request.scope)
+            if is_metered_route(route):
+                observe_request(
+                    method=method,
+                    route=route,
+                    status_code=status_code,
+                    duration_seconds=time.perf_counter() - started,
+                )
+
+
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     """应用工厂。测试里传入自定义 Settings 即可完全隔离环境。"""
     settings = settings or get_settings()
@@ -104,9 +148,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    # 审计器与探活缓存挂在 app 上：它们都有进程内状态（文件锁、TTL 缓存），
+    # 测试里每个 app 各一份，天然隔离。
+    app.state.audit = AuditLogger(settings.audit_log_path)
+    app.state.readiness = ReadinessProbe(ttl_seconds=settings.k8s_ready_cache_seconds)
 
+    # 异常处理必须在挂路由之前注册，保证所有路由的报错都收敛成同一种响应结构。
+    register_exception_handlers(app)
     _register_request_context(app)
+    # 后注册的在更外层，指标要包住全部中间件，所以放最后。
+    _register_metrics(app)
+
     app.include_router(health.router)
+    app.include_router(pods.router)
+    app.include_router(logs.router)
+    app.include_router(helm.router)
+    app.include_router(metrics_routes.router)
 
     return app
 
