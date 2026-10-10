@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+# 让 tests/ 里能 `import app`——项目根目录加入 sys.path。
+# 不设这个的话 pytest 只会把 tests/ 加进 sys.path（因为 tests 下没有 __init__.py）。
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    # starlette 0.27.0 的 TestClient 内部用了 httpx 已废弃的 `app=` 快捷参数。
+    # 这是我们刻意把 httpx 锁在 0.27.x 的结果，不是需要处理的问题。
+    "ignore:The 'app' shortcut is now deprecated:DeprecationWarning",
+]
+markers = [
+    "integration: 需要真实 k8s 集群的测试，默认跳过（设置 RUN_K8S_INTEGRATION=1 才运行）",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", ".venv312"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

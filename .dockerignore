@@ -1,0 +1,39 @@
+# 目的：镜像里只保留运行应用所需的最小集合。
+# 原 Dockerfile 的 `COPY . .` 会把 .venv312（数百 MB 的 Windows 虚拟环境）、
+# .idea、测试和部署清单全部打进镜像。
+
+.venv
+.venv312
+venv
+
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+
+.idea
+.vscode
+
+.git
+.gitignore
+.dockerignore
+
+tests/
+deploy/
+docs/
+
+pyproject.toml
+requirements-dev.txt
+test_main.http
+README.md
+
+*.log
+audit.jsonl
+.pytest_cache
+.coverage
+htmlcov
+
+.env
+.env.*
+kubeconfig
+*.kubeconfig
