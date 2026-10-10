@@ -1,0 +1,7 @@
+-r requirements.txt
+
+pytest==8.3.4
+
+# 不能升到 0.28+：starlette 0.27.0 的 TestClient 会给 httpx.Client 传 `app=`，
+# 该参数在 httpx 0.28.0 已被移除，升级后会直接 TypeError。
+httpx==0.27.2

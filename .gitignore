@@ -1,0 +1,31 @@
+# 虚拟环境（.venv 是残留的死目录，.venv312 是真正在用的环境）
+.venv/
+.venv312/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE
+.idea/
+
+# 本地配置与凭据：绝不入库
+.env
+.env.*
+!.env.example
+kubeconfig
+*.kubeconfig
+
+# 运行时产物
+*.log
+audit.jsonl
