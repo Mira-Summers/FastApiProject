@@ -18,6 +18,7 @@ from app.api.routes import health, helm, logs, pods
 from app.api.routes import metrics as metrics_routes
 from app.audit import AuditLogger
 from app.config import Settings, get_settings
+from app.dependencies import build_authenticator
 from app.errors import register_exception_handlers
 from app.k8s.readiness import ReadinessProbe
 from app.logging_setup import (
@@ -34,6 +35,9 @@ from app.metrics import (
     route_template,
     track_in_progress,
 )
+from app.policy.engine import PolicyEngine
+from app.policy.model import load_policy
+from app.security.authorizer import SarAuthorizer
 
 logger = logging.getLogger("app.request")
 
@@ -41,6 +45,7 @@ logger = logging.getLogger("app.request")
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
+    policy: PolicyEngine = app.state.policy
     logger.info(
         "应用启动",
         extra={
@@ -48,8 +53,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "env": settings.app_env,
             "version": settings.app_version,
             "auth_mode": settings.auth_mode,
+            "policy_path": settings.policy_path,
+            "policy_rules": len(policy.document.rules),
         },
     )
+    if not policy.document.rules:
+        # 不是错误，但必须显眼：没配策略意味着所有 Helm 操作都会被拒。
+        # 不写这条日志的话，现象是「所有 helm 接口都 403，但找不到原因」。
+        logger.warning(
+            "策略为空：所有 Helm 操作（history / rollback）都会被拒绝。"
+            "如需启用，请设置 POLICY_PATH 指向策略文件",
+            extra={"event": "empty_policy"},
+        )
     if settings.auth_disabled:
         # 这条日志必须刺眼：免认证模式下面向网络开放等于把回滚权限公开。
         logger.warning(
@@ -149,9 +164,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     )
     app.state.settings = settings
     # 审计器与探活缓存挂在 app 上：它们都有进程内状态（文件锁、TTL 缓存），
-    # 测试里每个 app 各一份，天然隔离。
+    # 测试里每个 app 各一份，天然隔离。认证器的 token 指纹缓存同理。
     app.state.audit = AuditLogger(settings.audit_log_path)
     app.state.readiness = ReadinessProbe(ttl_seconds=settings.k8s_ready_cache_seconds)
+    app.state.authenticator = build_authenticator(settings)
+    app.state.authorizer = SarAuthorizer(settings)
+    # 策略文件在这里读：读不到或者内容非法就直接拒绝启动。
+    # 一个「策略加载失败但仍然起来了」的服务比直接崩掉危险得多——
+    # 它会以一个没人知道的权限状态对外提供服务。
+    app.state.policy = PolicyEngine(load_policy(settings.policy_path))
 
     # 异常处理必须在挂路由之前注册，保证所有路由的报错都收敛成同一种响应结构。
     register_exception_handlers(app)

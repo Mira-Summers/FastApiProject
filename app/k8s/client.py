@@ -20,10 +20,16 @@ from app.errors import ServiceUnavailable, from_api_exception
 
 logger = logging.getLogger("app.k8s")
 
-__all__ = ["CoreV1ApiLike", "build_core_api", "ping"]
+__all__ = [
+    "AuthorizationV1ApiLike",
+    "CoreV1ApiLike",
+    "build_authz_api",
+    "build_core_api",
+    "ping",
+]
 
 _lock = threading.Lock()
-_cache: dict[Settings, Any] = {}
+_cache: dict[tuple[Settings, str], Any] = {}
 
 
 class CoreV1ApiLike(Protocol):
@@ -39,6 +45,14 @@ class CoreV1ApiLike(Protocol):
     def read_namespaced_pod_log(self, name: str, namespace: str, **kwargs: Any) -> str: ...
 
     def list_namespace(self, **kwargs: Any) -> Any: ...
+
+    def create_token_review(self, body: Any, **kwargs: Any) -> Any: ...
+
+
+class AuthorizationV1ApiLike(Protocol):
+    """认证鉴权相关的 API 子集（SubjectAccessReview）。"""
+
+    def create_subject_access_review(self, body: Any, **kwargs: Any) -> Any: ...
 
 
 def _load_default_configuration() -> None:
@@ -67,22 +81,42 @@ def _load_default_configuration() -> None:
     logger.info("已加载本地 kubeconfig", extra={"event": "kubeconfig_loaded", "source": "kubeconfig"})
 
 
-def build_core_api(settings: Settings) -> CoreV1ApiLike:
-    """构建（并缓存）CoreV1Api。首次调用时才真正去加载集群配置。"""
-    cached = _cache.get(settings)
+def _build(settings: Settings, kind: str, factory: Any) -> Any:
+    """按 (配置, 客户端种类) 缓存地构建 SDK 客户端。
+
+    两种客户端必须共享同一次集群配置加载：`load_incluster_config()` 会改动
+    全局的 `Configuration` 默认值，重复调用本身虽然幂等，但每次都要读磁盘上的
+    token 文件。更重要的是把缓存键做成 (settings, kind) 之后，
+    `create_app()` 在测试里换一份 Settings 不会串到上一个 app 的客户端。
+    """
+    key = (settings, kind)
+    cached = _cache.get(key)
     if cached is not None:
         return cached
 
     with _lock:
-        cached = _cache.get(settings)
+        cached = _cache.get(key)
         if cached is None:
             _load_default_configuration()
             # 刻意不传 configuration：让 ApiClient 走 Configuration.get_default_copy()，
             # 这样 in-cluster 的 token 刷新钩子才会被保留（deepcopy 对函数是原子操作）。
-            cached = client.CoreV1Api()
-            _cache[settings] = cached
-            logger.info("已构建 CoreV1Api 客户端", extra={"event": "core_api_ready"})
+            cached = factory()
+            _cache[key] = cached
+            logger.info(
+                "已构建集群客户端",
+                extra={"event": "k8s_client_ready", "client": kind},
+            )
     return cached
+
+
+def build_core_api(settings: Settings) -> CoreV1ApiLike:
+    """构建（并缓存）CoreV1Api。首次调用时才真正去加载集群配置。"""
+    return _build(settings, "core_v1", client.CoreV1Api)
+
+
+def build_authz_api(settings: Settings) -> AuthorizationV1ApiLike:
+    """构建（并缓存）AuthorizationV1Api，用于 SubjectAccessReview。"""
+    return _build(settings, "authorization_v1", client.AuthorizationV1Api)
 
 
 def ping(core: CoreV1ApiLike, *, request_timeout: float) -> None:

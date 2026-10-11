@@ -17,7 +17,9 @@ from app.metrics import (
     HELM_ROLLBACKS_TOTAL,
     HTTP_REQUEST_DURATION,
     HTTP_REQUESTS_TOTAL,
+    INVALID_LABEL_VALUE,
     UNMATCHED_ROUTE,
+    record_rollback,
 )
 from tests.fakes import make_api_exception
 
@@ -221,26 +223,38 @@ def test_failed_rollback_is_counted_as_failed(client, helm_runner):
 
 
 def test_invalid_namespace_cannot_expand_the_label_cardinality(client, helm_runner):
-    """记账发生在参数校验**之前**（否则失败的尝试会丢记录），
+    """调用方完全控制 namespace 时，它绝不能成为标签值。
 
-    此时 namespace 完全由调用方控制，直接当标签用等于把基数交给攻击者。
+    Phase 3 之后非法 namespace 在守卫处就被 400 挡掉，压根走不到记账那一步，
+    所以这里断言的是更强的一条性质：**不产生任何新的时间序列**。
+    调用方不该能用请求路径来制造指标基数——这是不需要任何权限就能触发的放大路径。
     """
-    before = counter(
-        client, "k8s_ops_helm_rollbacks_total", namespace="__invalid__", result="failed"
-    )
-
     response = client.post(
         "/api/v1/namespaces/NotAValidNamespace/helm/releases/web/rollback",
         json={"confirm": True},
     )
 
     assert response.status_code == 400
+    assert "NotAValidNamespace" not in client.get("/metrics").text
+
+
+def test_record_rollback_neutralises_unvalidated_namespaces():
+    """`record_rollback` 自己也要兜底，不能假设调用方一定校验过。
+
+    这是一个模块级入口，将来多一个调用点就可能多一处漏校验。
+    把「标签值必须收敛成有限集合」这条性质放在指标模块内部，
+    就不必依赖每个调用点都记得先校验。
+    """
+    before = (
+        HELM_ROLLBACKS_TOTAL.labels(namespace=INVALID_LABEL_VALUE, result="failed")._value.get()
+    )
+    record_rollback("../../etc/passwd", "failed")
+
     assert (
-        counter(client, "k8s_ops_helm_rollbacks_total", namespace="__invalid__", result="failed")
+        HELM_ROLLBACKS_TOTAL.labels(namespace=INVALID_LABEL_VALUE, result="failed")._value.get()
         - before
         == 1
     )
-    assert "NotAValidNamespace" not in client.get("/metrics").text
 
 
 def test_all_metric_names_are_prefixed() -> None:

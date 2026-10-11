@@ -1,52 +1,74 @@
 # K8s 运维助手 —— 接口速查
 #
 # 启动：.venv312\Scripts\uvicorn main:app --reload
-# Phase 3 之后所有 /api/v1/* 接口都需要带 Authorization 头：
+#
+# 所有 /api/v1/* 接口都要带 Authorization 头。签发 token：
 #   kubectl create token ops-api -n k8s-ops-api --audience=k8s-ops-api
-#   并把下面的 {{token}} 换成实际值。
+# 把下面的 {{token}} 换成实际值（注意：token 有有效期，默认 1 小时）。
+#
+# 授权分两套，别混淆：
+#   - Pod / 日志：由**集群 RBAC** 判定，用 `kubectl auth can-i` 就能预先自查
+#       kubectl auth can-i list pods -n default --as=<你的用户名>
+#       kubectl auth can-i get pods/log -n default --as=<你的用户名>
+#   - Helm：由 POLICY_PATH 指向的**策略文件**判定，集群 RBAC 管不到 release 这一层
 
-### 存活探针：不触碰集群，进程活着就返回 200
+@token = REPLACE_ME
+
+### 存活探针：不触碰集群，进程活着就返回 200（免认证）
 # 刻意不依赖 k8s：集群抖动时不能让 kubelet 杀掉健康的 Pod
 GET http://127.0.0.1:8000/health/live
 
-### 就绪探针：真打一次 API Server（结果缓存 5 秒，失败也缓存）
+### 就绪探针：真打一次 API Server（结果缓存 5 秒，失败也缓存）（免认证）
 # 集群不可达时返回 503；本地没有集群时这里就是 503
 GET http://127.0.0.1:8000/health/ready
 
 ### Prometheus 指标（免认证，靠 NetworkPolicy 收在集群内）
 GET http://127.0.0.1:8000/metrics
 
-### 服务元信息
+### 服务元信息（免认证）
 GET http://127.0.0.1:8000/
 
-### 列出 default 命名空间下的 Pod
+### 不带 token：应当返回 401，且响应头有 WWW-Authenticate: Bearer
 GET http://127.0.0.1:8000/api/v1/namespaces/default/pods
+
+### 列出 default 命名空间下的 Pod（需要 list pods）
+GET http://127.0.0.1:8000/api/v1/namespaces/default/pods
+Authorization: Bearer {{token}}
 
 ### 按标签与阶段过滤（运维最常用）
 GET http://127.0.0.1:8000/api/v1/namespaces/default/pods?label_selector=app%3Dweb&field_selector=status.phase%3DRunning
+Authorization: Bearer {{token}}
 
 ### 只关心出问题的 Pod：按重启次数排序看
 GET http://127.0.0.1:8000/api/v1/namespaces/kube-system/pods?field_selector=status.phase%3DRunning
+Authorization: Bearer {{token}}
 
-### 单个 Pod 详情（含容器状态、上次终止原因与退出码）
+### 单个 Pod 详情（含容器状态、上次终止原因与退出码）（需要 get pods）
 GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123
+Authorization: Bearer {{token}}
 
-### 读取日志末尾 100 行
+### 读取日志末尾 100 行（需要 get pods/log —— 与 get pods 是不同的权限）
 GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123/logs?tail_lines=100
+Authorization: Bearer {{token}}
 
 ### CrashLoopBackOff 排障：读上一个已终止容器的日志
 GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123/logs?previous=true&container=app&tail_lines=200
+Authorization: Bearer {{token}}
 
 ### 只取最近 10 分钟的日志并带时间戳
 GET http://127.0.0.1:8000/api/v1/namespaces/default/pods/web-abc123/logs?since_seconds=600&timestamps=true
+Authorization: Bearer {{token}}
 
-### 查询 Helm release 的版本历史
+### 查询 Helm release 的版本历史（需要策略里的 helm.history）
 GET http://127.0.0.1:8000/api/v1/namespaces/default/helm/releases/web/history
+Authorization: Bearer {{token}}
 
-### 回滚到指定版本（必须显式 confirm，否则 400）
-# 无论成功失败都会写审计：先记 attempted，再记 succeeded/failed。
+### 回滚到指定版本（需要策略里的 helm.rollback，且必须显式 confirm，否则 400）
+# 无论成功失败都会写审计：先记 attempted，再记 succeeded/failed，
+# actor 是通过认证的那张身份（不是 anonymous）。
 # 带 X-Request-ID 可以把审计、访问日志、错误响应串成一条线。
 POST http://127.0.0.1:8000/api/v1/namespaces/default/helm/releases/web/rollback
+Authorization: Bearer {{token}}
 Content-Type: application/json
 X-Request-ID: trace-rollback-001
 
@@ -57,6 +79,7 @@ X-Request-ID: trace-rollback-001
 
 ### 回滚到上一个版本（不传 revision）
 POST http://127.0.0.1:8000/api/v1/namespaces/default/helm/releases/web/rollback
+Authorization: Bearer {{token}}
 Content-Type: application/json
 
 {

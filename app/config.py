@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Mapping, Optional
 
@@ -76,6 +76,14 @@ def _read_optional_bool(env: Mapping[str, str], key: str) -> Optional[bool]:
     return None if env.get(key) is None else _read_bool(env, key, default=False)
 
 
+def _read_csv(env: Mapping[str, str], key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """逗号分隔的字符串列表。空字符串视为空元组，而不是「包含一个空串的元组」。"""
+    raw = env.get(key)
+    if raw is None:
+        return default
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     """全部运行期配置。frozen 是为了让它能安全地被缓存和跨线程共享。"""
@@ -115,7 +123,14 @@ class Settings:
     auth_allow_insecure: bool = False
     # disabled 模式下的合成身份。
     auth_dev_username: str = "dev@local"
-    auth_dev_groups: tuple[str, ...] = field(default_factory=lambda: ("system:authenticated",))
+    auth_dev_groups: tuple[str, ...] = ("system:authenticated",)
+
+    # --- 授权（Helm 策略）---
+    # Helm 动作的授权策略文件（YAML）。留空表示不启用任何 Helm 变更操作：
+    # 策略为空时引擎默认拒绝，而不是默认放行。
+    # 只在启动时读取一次。要改策略就改 ConfigMap 再滚动重启——让「策略何时变更」
+    # 在 Deployment 的 revision 历史里留下痕迹，而不是变成一个无人知晓的运行时事件。
+    policy_path: Optional[str] = None
 
     # --- 审计 ---
     # 为空则审计事件只写日志；设置后额外追加写入该 JSONL 文件。
@@ -171,6 +186,8 @@ class Settings:
             ),
             auth_allow_insecure=_read_bool(source, "AUTH_ALLOW_INSECURE", False),
             auth_dev_username=_read_str(source, "AUTH_DEV_USERNAME", cls.auth_dev_username),
+            auth_dev_groups=_read_csv(source, "AUTH_DEV_GROUPS", cls.auth_dev_groups),
+            policy_path=source.get("POLICY_PATH") or None,
             audit_log_path=source.get("AUDIT_LOG_PATH") or None,
         )
         settings.validate(env=source)
