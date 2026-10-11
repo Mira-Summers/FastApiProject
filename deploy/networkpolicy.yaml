@@ -1,0 +1,59 @@
+# 入向限制：默认拒绝，只放行两类来源。
+#
+# 一旦有 NetworkPolicy 选中了这个 Pod 并声明 policyTypes: [Ingress]，
+# 所有不匹配下面规则的入向流量都会被丢弃 —— 这就是默认拒绝。
+#
+# ── 先说清楚它做不到什么 ────────────────────────────────────────────
+# NetworkPolicy 工作在 L3/L4，**看不见 HTTP 路径**。
+# /metrics 和业务 API 共用 8000 端口（同一个 uvicorn 进程），
+# 所以"只放行 /metrics、拦住别的路径"这种事在这里是**做不到的**。
+# 能表达的只有「谁能连到这个端口」。
+#
+# 现实的含义是：能抓指标的来源，也能调 API。API 仍然要过 TokenReview 认证
+# 和 SAR 授权，所以这不是漏洞，但别以为这里拦住了什么。
+# 真要在路径层隔离 /metrics，只有两条路：
+#   - 前面放 Ingress / API 网关，在那一层拦掉 /metrics；
+#   - 把指标拆到第二个容器或第二个端口（需要改应用，目前没做）。
+#
+# ── 再说它什么时候不生效 ────────────────────────────────────────────
+# NetworkPolicy 需要 CNI 支持才会真正落地。`kubectl get networkpolicy` 显示对象
+# 存在，**不代表**流量真被拦住了。部署完请实际验证一次，别只看对象在不在：
+#   kubectl -n <别的namespace> run probe --rm -it --image=busybox -- \
+#     wget -qO- --timeout=3 http://k8s-ops-api.k8s-ops-api.svc.cluster.local/health/live
+# 预期是超时；如果返回了 200，说明你的 CNI 没有执行这条策略。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: k8s-ops-api
+  namespace: k8s-ops-api
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-ops-api
+  policyTypes:
+    - Ingress
+  ingress:
+    # 监控栈：Prometheus 抓 /metrics。
+    # 用 kubernetes.io/metadata.name 而不是自定义标签 —— 这个标签由集群自动打上
+    # （K8s 1.21+），不需要你先去给 namespace 打标签，少一步就会漏的配置。
+    # 命名空间名要改成你自己的（kube-prometheus-stack 默认装在 monitoring）。
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    # 调用方。默认给一个专用命名空间，比"放行所有 namespace"可审计得多。
+    # 如果你打算让调用方在各自命名空间里跑（免装 sidecar 之类的），
+    # 就把这一条放开成 podSelector，但那时"谁在调"就只能靠日志回答了。
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: k8s-ops-api-client
+      ports:
+        - protocol: TCP
+          port: 8000

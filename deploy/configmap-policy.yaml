@@ -1,0 +1,58 @@
+# Helm 操作的授权策略。
+#
+# 为什么 Helm 要单独一套策略，而不是复用集群 RBAC：
+# RBAC 里没有 "release" 这个概念。它只能表达"能不能读 default 里的 Secret"，
+# 表达不了"能不能回滚 default 里名为 web 的那个 release 的某一个修订"。
+# 用 RBAC 硬凑的结果是把 Secrets 的读写权当成回滚权的代理 —— 权限过大且含义错位。
+#
+# 为什么是 ConfigMap + 滚动重启，而不是热加载：
+# 策略变更应该留下痕迹。滚动重启会让"策略什么时候变的"出现在 Deployment 的
+# revision 历史里；热加载则把它变成一个没人知道的运行时事件。
+# app/config.py 只在这个文件被挂载后读一次，进程起来之后改 ConfigMap 不会生效。
+#
+# ★★ 下面这份是**示例**，直接照着上线等于把回滚权交给了一个叫 ops 的组。
+#    请先把 subjects 换成你自己的用户或组，再缩小 namespaces / releases 的范围。
+#    校验方式：kubectl auth whoami 看不到组，用 TokenReview 的返回更直接 ——
+#    实际上，随便打一个接口，一旦被拒，错误消息里会带上你的用户名与组。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-ops-api-policy
+  namespace: k8s-ops-api
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+data:
+  policy.yaml: |
+    version: 1
+    rules:
+      # Group 的名字就是 TokenReview 返回的组名（system:authenticated 之类）。
+      # 单个用户可以写 {kind: User, name: alice@example.com}。
+      - subjects:
+          - kind: Group
+            name: ops
+        allow:
+          # 只授 history 不授 rollback 是完全合理的组合：
+          # 让更多人"看得见"，只让少数人"动得了"。
+          - action: helm.history
+            namespaces: ["default"]
+            releases: ["web"]
+          - action: helm.rollback
+            namespaces: ["default"]
+            releases: ["web"]
+
+      # 只想给某一个人开一个 release 的回滚权，就单独加一条规则。
+      # 规则之间是**叠加**的（任一条允许即允许），不是覆盖关系：
+      #   - subjects:
+      #       - kind: User
+      #         name: oncall@example.com
+      #     allow:
+      #       - action: helm.rollback
+      #         namespaces: ["default"]
+      #         releases: ["web", "api"]
+      #
+      # 通配只能写 "*"，不支持 web-* 这种前缀匹配 —— 让"这条规则到底授权了什么"
+      # 能一眼读明白，比写起来方便重要。要匹配全部就必须显式写 ["*"]，
+      # 空列表会被当成配置错误直接拒绝启动。
+      #
+      # 动作名写错（比如 helm.rollbak）也会在启动时直接报错，
+      # 而不是变成一条"安全地永远不生效"的规则。

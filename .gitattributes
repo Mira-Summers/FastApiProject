@@ -1,0 +1,16 @@
+# 行尾策略。
+#
+# 本仓库在 Windows 上开发（core.autocrlf=true），但构建和运行都在 Linux 上。
+# 下面这两类文件的行尾是有语义的，必须钉死为 LF：
+#
+#   - Dockerfile：`RUN ... \` 的续行一旦变成 CRLF，反斜杠后面会多出一个 \r。
+#     这属于「本地能构建、换台机器就失败」那种最难查的问题。
+#   - *.sh：shebang 行尾的 \r 会让内核找不到解释器，就是经典的
+#     "bad interpreter: No such file or directory"。
+#
+# 其余文件不做干预，交给 core.autocrlf —— 全仓统一 eol 会带来一次巨大的
+# 重新规范化提交，而那些文件的行尾不影响任何行为（YAML 解析器接受 CRLF，
+# kubectl apply 也一样）。
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.sh text eol=lf

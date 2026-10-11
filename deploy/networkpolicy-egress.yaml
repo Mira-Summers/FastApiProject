@@ -1,0 +1,68 @@
+# 出向限制（**默认不在 kustomization 里，需要你手动启用**）。
+#
+# ── 为什么值得单独一份 ──────────────────────────────────────────────
+# 这个容器手里有一个能读全集群 Pod、能读写 release Secret 的 ServiceAccount token，
+# 还带着一个可执行的 helm。限制它的出向流量，能显著缩小"被攻破之后能往哪打"——
+# 尤其是挡住把 SA token 外传这种最典型的利用路径。
+#
+# ── 为什么不能直接 apply ────────────────────────────────────────────
+# 它需要知道本集群 API Server 的地址段，而这是集群相关的。填错的后果是：
+# 应用连不上 API Server → 所有业务接口 503、就绪探针失败 → CrashLoop 一样的效果。
+# 而现象看起来像代码 bug，排查方向会完全跑偏。
+#
+# ── 启用步骤 ────────────────────────────────────────────────────────
+# 1. 先看实际值（ipBlock 里要填的是**目标 IP**，不是域名）：
+#      kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}'
+#      kubectl get nodes -o wide          # 控制面节点 IP 段
+#    10.96.0.0/12 是 kubeadm / kind 的默认 Service CIDR，很多发行版不一样
+#    （k3s 默认 10.43.0.0/16；EKS 上 API Server 根本不在 Service CIDR 里，
+#     而是一个 VPC ENI 地址）。
+# 2. 改下面的 cidr。
+# 3. `kubectl apply -f deploy/networkpolicy-egress.yaml`
+# 4. **立刻验证**，别等出问题才发现：
+#      kubectl -n k8s-ops-api exec deploy/k8s-ops-api -- \
+#        python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8000/health/ready').status)"
+#    打印 200 说明 API Server 仍然可达；503 就是拦过头了。
+#    注意这一步用的是镜像里自带的 python —— 镜像里刻意没有 curl。
+#
+# ── 一个容易踩的坑 ──────────────────────────────────────────────────
+# 有些 CNI 是在 DNAT **之后**才匹配出向规则的。这种情况下 ipBlock 里要填的
+# 是**控制面节点的 IP**，而不是 Service CIDR。所以第 4 步的验证不能省：
+# 策略语法正确 ≠ 流量通。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: k8s-ops-api-egress
+  namespace: k8s-ops-api
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-ops-api
+  policyTypes:
+    - Egress
+  egress:
+    # DNS。少了这条，任何走域名的东西都会解析失败，而且报错通常很难懂。
+    # CoreDNS 装在 kube-system 是绝大多数集群的默认；装在别处就改这个名字。
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # API Server：TokenReview / SAR / 读 Pod 和日志 / helm 的全部后端都在这里。
+    - to:
+        - ipBlock:
+            # ★ 必须改成你集群的实际地址段，见文件头部第 1 步。
+            cidr: 10.96.0.0/12
+      ports:
+        - protocol: TCP
+          port: 443
+        # 直连控制面（绕过 Service）时用的端口，kind / kubeadm 都是 6443。
+        - protocol: TCP
+          port: 6443

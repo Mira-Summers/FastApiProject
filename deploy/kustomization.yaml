@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 刻意**不写** `namespace:` 字段。
+#
+# 本目录所有对象的 namespace 都是显式写死的 k8s-ops-api，为的是每个文件都能单独
+# `kubectl apply -f` 用，也为了避开一个经典坑：kustomize 的 namespace 变换
+# 不会改写 RoleBinding / ClusterRoleBinding 里的 subjects[].namespace。
+# 一旦用 kustomization 的 namespace 换命名空间，就会出现"主体还在老命名空间"
+# 这种只改了一半的状态，报错信息还完全指不到这里。
+#
+# 要换命名空间，请全局替换 k8s-ops-api（注意 rbac-helm.yaml 里的 namespace 是
+# **目标 release 的**命名空间 default，那一个是另一回事，别一起换掉）。
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  # 三份 RBAC 对应三种权限来源，分开是为了让"谁需要什么"一眼可读：
+  #   rbac-auth  —— 认证/授权本身能不能跑（TokenReview + SAR）
+  #   rbac-pods  —— 本服务的爆炸半径（读 Pod / 读日志）
+  #   rbac-helm  —— helm release Secret 的读写，namespace 级
+  - rbac-auth.yaml
+  - rbac-pods.yaml
+  - rbac-helm.yaml
+  - configmap-config.yaml
+  - configmap-policy.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+  # 未纳入：networkpolicy-egress.yaml
+  #   默认拒绝出向，启用前必须先改里面的 API Server CIDR，改错会让应用全部 503。
+  #   详见该文件头部的启用步骤。
+
+images:
+  # 用 kustomize 换镜像标签，而不是去改 deployment.yaml：
+  # 发布流程里 "改了哪个版本的镜像" 应该只在一个地方发生。
+  # 注意这个 tag 和 configmap-config.yaml 里的 APP_VERSION 是两件事
+  # （前者是镜像，后者是 / 接口自报的版本），升级时两个都要改。
+  - name: k8s-ops-api
+    newTag: "2.0.0"

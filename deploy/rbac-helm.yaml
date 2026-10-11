@@ -1,0 +1,54 @@
+# helm 的 release 状态存在 Secret 里（type: helm.sh/release.v1）。
+# history 要能读它，rollback 要能读旧版本、写新版本 —— 漏了这条权限，
+# 回滚会报 "cannot get release" 这种看起来像 helm 坏了、其实是 RBAC 的错误。
+#
+# ★★ 这个 Role 建在 **目标 release 所在的 namespace**，不是本服务自己的 namespace。
+#    要回滚 default 里的 release，这份 Role 就得在 default。下面以 default 为例。
+#    要允许多个 namespace 回滚，就把这份文件复制到每个 namespace ——
+#    改 metadata.namespace，然后 `kubectl apply -f rbac-helm.yaml -n <ns>`。
+#    注意这份权限的范围必须和 ConfigMap 里 policy.yaml 的 namespaces 字段对得上：
+#    策略说可以、RBAC 说不行，报错会在 helm 那一步；反过来策略不放行，
+#    你会在授权阶段就被 403 拦住，永远也走不到这里。
+#
+# ★★ 为什么必须是 namespace 级的 Role，绝不能换成 ClusterRole：
+#    Secrets 的集群级读写 ≈ 交出整个集群。任何 namespace 里的 ServiceAccount
+#    token 本身就是一个 Secret，拿到它就能冒充那个 SA。
+#
+# ★ 还有一半不在这里：helm rollback 会把该 revision 的清单重新 apply 一遍。
+#   清单里的 Deployment / ConfigMap / Service 同样需要本 SA 有权限，
+#   否则回滚会在 apply 阶段失败。这里只给了 release 状态所需的 Secrets 权限，
+#   业务资源的权限按你实际要回滚的 chart 另加。别为了省事直接给它 cluster-admin。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-ops-api:helm-releases
+  namespace: default
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # 逐条对应 helm 的实际动作：
+    #   list   —— history 按 label selector 列 release 的所有 revision
+    #   get    —— 读某个具体 revision
+    #   create —— rollback 会写一个**新** revision 的 Secret（不是原地改）
+    #   update —— 把上一个 revision 的状态标成 superseded
+    # 刻意不含 delete：本服务只做 history / rollback，不做 uninstall。
+    # 哪天要加卸载接口，再单独把 delete 补上，并且要在评审里说明。
+    verbs: ["get", "list", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-ops-api:helm-releases
+  namespace: default
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k8s-ops-api:helm-releases
+subjects:
+  - kind: ServiceAccount
+    name: k8s-ops-api
+    namespace: k8s-ops-api

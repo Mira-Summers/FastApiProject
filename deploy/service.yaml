@@ -1,0 +1,27 @@
+# 刻意用 ClusterIP，而不是 NodePort / LoadBalancer：
+# 这个服务能回滚生产 release，不该为了方便顺手暴露到集群外。
+#
+# 集群内调用方直接用这个地址：
+#   http://k8s-ops-api.k8s-ops-api.svc.cluster.local/api/v1/namespaces/default/pods
+#
+# 本机调试用端口转发，**不要**为此把 Service 改成 NodePort
+# （改完很容易忘记改回去，而这个口子是不需要任何凭据就能访问的——
+#   认证在应用层，端口暴露在集群外等于把 401/403 的判定交给公网流量去撞）：
+#   kubectl -n k8s-ops-api port-forward svc/k8s-ops-api 8000:80
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-ops-api
+  namespace: k8s-ops-api
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: k8s-ops-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
