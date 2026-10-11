@@ -36,6 +36,44 @@ rules:
     resources: ["pods/log"]
     verbs: ["get"]
 ---
+# ★ 这个权限不是给业务接口用的，是给**就绪探针**用的，漏了会很难查。
+#
+# app/k8s/client.py 的 ping() 用 `list_namespace(limit=1)` 做探活：
+# 它一次同时验证「网络可达 + 认证通过 + 授权通过」，而且 limit=1 几乎不产生负载。
+# 代价是就绪探针因此依赖 namespaces 的 list 权限 —— 这是集群级资源，
+# system:authenticated 默认没有。
+#
+# 漏掉这一条的后果不是某个接口 403，而是：/health/ready 永远 503 →
+# Pod 永远不 Ready → Deployment 永远没有可用副本 → kubectl rollout status 一直挂着。
+# 现象看起来像"集群连不上"或"镜像有问题"，而不像 RBAC 少了一条。
+#
+# 只授 list，不授 get/watch：探活只需要列出（哪怕只列 1 条）。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-ops-api:readiness
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-ops-api:readiness
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-ops-api:readiness
+subjects:
+  - kind: ServiceAccount
+    name: k8s-ops-api
+    namespace: k8s-ops-api
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
