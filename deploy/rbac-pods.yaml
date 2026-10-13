@@ -1,0 +1,114 @@
+# 本服务自己读写 Pod / 日志的权限 —— 这是「爆炸半径」的真正边界。
+#
+# ★ 先分清两件事，这是本服务最容易理解错的地方：
+#
+#   「谁能用本服务」由 SubjectAccessReview 判定（app/security/authorizer.py），
+#   而**真实调用用的是本 SA 的身份**。
+#
+#   所以这里授予的范围，就是本服务能被滥用的上限。给它 cluster-admin，
+#   并不等于每个用户都成了管理员 —— 但等于把 cluster-admin 借给了每一个
+#   能通过 SAR 判定的人。SA 的权限和调用方的权限是两个独立的闸门，缺一不可，
+#   也各自都能成为短板。
+#
+# 为什么拆成两个 ClusterRole：pods 和 pods/log 在 RBAC 里是两个独立子资源
+# （app/security/guards.py 里读日志走的是 subresource="log" 的单独一次 SAR）。
+# 日志里经常夹着凭据 —— 环境变量、连接串、启动参数。很多团队只肯给 pods 不给日志。
+# 分开授权，就能在不改一行代码的前提下做到「能看 Pod 状态，但看不了日志」。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-ops-api:pods-reader
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-ops-api:pods-logs-reader
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+# ★ 这个权限不是给业务接口用的，是给**就绪探针**用的，漏了会很难查。
+#
+# app/k8s/client.py 的 ping() 用 `list_namespace(limit=1)` 做探活：
+# 它一次同时验证「网络可达 + 认证通过 + 授权通过」，而且 limit=1 几乎不产生负载。
+# 代价是就绪探针因此依赖 namespaces 的 list 权限 —— 这是集群级资源，
+# system:authenticated 默认没有。
+#
+# 漏掉这一条的后果不是某个接口 403，而是：/health/ready 永远 503 →
+# Pod 永远不 Ready → Deployment 永远没有可用副本 → kubectl rollout status 一直挂着。
+# 现象看起来像"集群连不上"或"镜像有问题"，而不像 RBAC 少了一条。
+#
+# 只授 list，不授 get/watch：探活只需要列出（哪怕只列 1 条）。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-ops-api:readiness
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-ops-api:readiness
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-ops-api:readiness
+subjects:
+  - kind: ServiceAccount
+    name: k8s-ops-api
+    namespace: k8s-ops-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-ops-api:pods-reader
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-ops-api:pods-reader
+subjects:
+  - kind: ServiceAccount
+    name: k8s-ops-api
+    namespace: k8s-ops-api
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-ops-api:pods-logs-reader
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-ops-api:pods-logs-reader
+subjects:
+  - kind: ServiceAccount
+    name: k8s-ops-api
+    namespace: k8s-ops-api
+#
+# 想从「全集群」收窄到「某几个 namespace」？**不用改上面的 ClusterRole**。
+# RoleBinding 可以引用 ClusterRole（反过来不行），所以在目标 namespace 里建一个
+# RoleBinding 指向 k8s-ops-api:pods-reader，权限就只在那几个 namespace 生效：
+#
+#   kubectl -n <目标namespace> create rolebinding k8s-ops-api:pods-reader \
+#     --clusterrole=k8s-ops-api:pods-reader --serviceaccount=k8s-ops-api:k8s-ops-api
+#
+# 建完之后可以把这里的两个 ClusterRoleBinding 删掉。

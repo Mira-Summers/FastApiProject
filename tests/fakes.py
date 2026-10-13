@@ -15,12 +15,14 @@ from kubernetes.client.rest import ApiException
 from app.helm.runner import HelmResult
 
 __all__ = [
+    "FakeAuthorizationV1Api",
     "FakeCoreV1Api",
     "FakeHelmRunner",
     "make_api_exception",
     "make_container_status",
     "make_pod",
     "make_state",
+    "make_token_review",
 ]
 
 
@@ -98,6 +100,31 @@ def make_pod(
     )
 
 
+def make_token_review(
+    *,
+    authenticated: bool = True,
+    username: str = "alice@example.com",
+    uid: str = "uid-alice",
+    groups: Optional[list[str]] = None,
+    audiences: Optional[list[str]] = None,
+    error: Optional[str] = None,
+) -> SimpleNamespace:
+    """构造 V1TokenReview 的响应形状。"""
+    status = SimpleNamespace(
+        authenticated=authenticated,
+        user=SimpleNamespace(
+            username=username,
+            uid=uid,
+            groups=groups if groups is not None else ["ops"],
+        )
+        if authenticated
+        else None,
+        audiences=audiences if audiences is not None else ["k8s-ops-api"],
+        error=error,
+    )
+    return SimpleNamespace(status=status)
+
+
 class FakeCoreV1Api:
     """替代 CoreV1Api。会记录每次调用的参数，便于断言路由是否如实透传。"""
 
@@ -108,11 +135,15 @@ class FakeCoreV1Api:
         log_text: str = "",
         continue_token: Optional[str] = None,
         error: Optional[Exception] = None,
+        token_review: Optional[SimpleNamespace] = None,
+        token_review_error: Optional[Exception] = None,
     ) -> None:
         self.pods = pods if pods is not None else []
         self.log_text = log_text
         self.continue_token = continue_token
         self.error = error
+        self.token_review = token_review if token_review is not None else make_token_review()
+        self.token_review_error = token_review_error
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def _record(self, method: str, kwargs: dict[str, Any]) -> None:
@@ -145,6 +176,70 @@ class FakeCoreV1Api:
     def list_namespace(self, **kwargs: Any) -> Any:
         self._record("list_namespace", kwargs)
         return SimpleNamespace(items=[])
+
+    def create_token_review(self, body: Any, **kwargs: Any) -> Any:
+        # 记录的是 body 本身（真实的 V1TokenReview），测试因此可以直接断言
+        # 「spec.audiences 有没有传」——这正是最容易漏、漏了后果最严重的一处。
+        self._record("create_token_review", {"body": body, **kwargs})
+        if self.token_review_error is not None:
+            raise self.token_review_error
+        return self.token_review
+
+    def token_review_requests(self) -> list[Any]:
+        return [kwargs["body"] for name, kwargs in self.calls if name == "create_token_review"]
+
+
+class FakeAuthorizationV1Api:
+    """替代 AuthorizationV1Api。
+
+    默认放行。返回的是 SDK 的响应形状（status.allowed 等），
+    这样被测的是真实的 `SarAuthorizer` 逻辑，而不是一个被替换掉的空壳。
+    """
+
+    def __init__(
+        self,
+        *,
+        allowed: bool = True,
+        reason: str = "",
+        evaluation_error: Optional[str] = None,
+        error: Optional[Exception] = None,
+    ) -> None:
+        self.allowed = allowed
+        self.reason = reason
+        self.evaluation_error = evaluation_error
+        self.error = error
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def create_subject_access_review(self, body: Any, **kwargs: Any) -> Any:
+        self.calls.append(("create_subject_access_review", {"body": body, **kwargs}))
+        if self.error is not None:
+            raise self.error
+        # 求值失败时集群一定不会返回 allowed=true，这里如实照做。
+        # 让假实现允许「既失败又放行」的组合，会掩盖掉被测代码
+        # 「求值失败必须先于 allowed 判定」这条性质。
+        allowed = self.allowed and not self.evaluation_error
+        return SimpleNamespace(
+            status=SimpleNamespace(
+                allowed=allowed,
+                denied=not allowed and not self.evaluation_error,
+                reason=self.reason,
+                evaluationError=self.evaluation_error,
+            )
+        )
+
+    def review_requests(self) -> list[Any]:
+        return [kwargs["body"] for _, kwargs in self.calls]
+
+    def last_attributes(self) -> Any:
+        """最后一次 SAR 的资源属性，便于断言 verb/resource/subresource。"""
+        reviews = self.review_requests()
+        assert reviews, "还没有发起过 SubjectAccessReview"
+        return reviews[-1].spec.resource_attributes
+
+    def last_spec(self) -> Any:
+        reviews = self.review_requests()
+        assert reviews, "还没有发起过 SubjectAccessReview"
+        return reviews[-1].spec
 
 
 class FakeHelmRunner:

@@ -1,0 +1,29 @@
+# 让「认证」和「授权」这两件事本身能跑起来。
+#
+# system:auth-delegator 是 K8s 预置的 ClusterRole，只授予两件事：
+#   - create authentication.k8s.io/tokenreviews
+#   - create authorization.k8s.io/subjectaccessreviews
+#
+# 缺了它，本服务的每一个请求都会 403：
+#   - 认证阶段：TokenReview 被拒 → app/security/tokenreview.py 抛 PermissionDenied；
+#   - 授权阶段：SubjectAccessReview 被拒 → app/security/authorizer.py 抛 PermissionDenied。
+# 这两种现象都极易被误判成「调用方的 RBAC 配错了」，所以两处错误消息里都直接
+# 写明了要绑 system:auth-delegator。看到那句话，第一个要查的就是这个文件。
+#
+# 为什么是 ClusterRoleBinding 而不是 RoleBinding：TokenReview / SubjectAccessReview
+# 都是集群级资源，没有 namespace 可以缩小。风险可控——这个权限只能「问问题」，
+# 读不到也改不了任何业务对象。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-ops-api:auth-delegator
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: k8s-ops-api
+    namespace: k8s-ops-api

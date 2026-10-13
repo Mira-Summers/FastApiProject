@@ -17,6 +17,8 @@ from app.k8s.pods import get_pod as fetch_pod
 from app.k8s.pods import list_pods as fetch_pods
 from app.schemas.errors import COMMON_ERROR_RESPONSES
 from app.schemas.pods import PodInfo, PodListResponse
+from app.security.guards import require_pod_get, require_pod_list
+from app.security.identity import Identity
 
 router = APIRouter(
     prefix="/api/v1/namespaces/{namespace}/pods",
@@ -25,9 +27,16 @@ router = APIRouter(
 )
 
 
-@router.get("", response_model=PodListResponse, summary="列出命名空间下的 Pod")
+@router.get(
+    "",
+    response_model=PodListResponse,
+    summary="列出命名空间下的 Pod",
+    description="需要调用方具备该 namespace 的 `list pods` 权限（由集群 RBAC 判定）。",
+)
 def list_pods(
     namespace: str,
+    # 守卫放在第一个：认证与授权必须先于其它任何副作用发生。
+    _identity: Identity = Depends(require_pod_list),
     label_selector: Optional[str] = Query(
         None, description="标签选择器，例如 app=web,tier!=cache"
     ),
@@ -58,10 +67,16 @@ def list_pods(
     )
 
 
-@router.get("/{pod_name}", response_model=PodInfo, summary="查询单个 Pod 的详情")
+@router.get(
+    "/{pod_name}",
+    response_model=PodInfo,
+    summary="查询单个 Pod 的详情",
+    description="需要调用方具备该 namespace 的 `get pods` 权限（由集群 RBAC 判定）。",
+)
 def get_pod(
     namespace: str,
     pod_name: str,
+    _identity: Identity = Depends(require_pod_get),
     core: CoreV1ApiLike = Depends(get_core_api),
     settings: Settings = Depends(get_settings),
 ) -> PodInfo:

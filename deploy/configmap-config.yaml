@@ -1,0 +1,49 @@
+# 运行期配置。改这里之后需要滚动重启才会生效：
+#   kubectl -n k8s-ops-api rollout restart deploy/k8s-ops-api
+# （ConfigMap 的更新不会自动传进已经跑着的进程 —— 这是刻意的，
+#   见 README「配置项」一节。）
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-ops-api-config
+  namespace: k8s-ops-api
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+data:
+  APP_ENV: "production"
+  APP_VERSION: "2.0.0"
+  LOG_LEVEL: "INFO"
+  # production 下默认就是 JSON（app/config.py 的 _resolved_log_json），这里显式写出来
+  # 是因为日志会被采集器按 JSON 解析，这条配置的"来源"越明显越好。
+  LOG_JSON: "true"
+
+  # --- 认证 ---
+  AUTH_MODE: "tokenreview"
+  # 调用方签发 token 时要带的 audience：
+  #   kubectl create token <sa> -n <ns> --audience=k8s-ops-api
+  # 两边对不上就会被拒。不校验 audience 的 TokenReview 只验签名，
+  # 而 legacy 那种永不过期的 token 恰好能通过 —— 等于悄悄放宽了信任边界。
+  AUTH_AUDIENCE: "k8s-ops-api"
+  # 身份校验结果的缓存时间。代价是**撤销延迟**：token 被吊销后，最长还要过这么久
+  # 才会开始拒绝。本服务能执行生产回滚，如果你觉得这个窗口不可接受，设为 "0"
+  # （每次请求都打一次 TokenReview —— 运维工具 QPS 很低，这个代价通常付得起）。
+  AUTH_CACHE_TTL_SECONDS: "30"
+  # AUTH_MODE=disabled / AUTH_ALLOW_INSECURE 刻意不出现在这里。
+  # 免认证模式需要三重条件同时成立才能启动（development + 显式确认 + 不在 Pod 内），
+  # 其中"不在 Pod 内"就是为了防止它被误带进集群。
+
+  # --- Kubernetes 访问 ---
+  K8S_REQUEST_TIMEOUT_SECONDS: "10"
+  # 就绪探针的结果缓存。取值要 ≥ 探针周期，否则每次探测都会真打一次 API Server；
+  # 代价是集群故障时"摘除 Endpoint"最多晚这么久。
+  K8S_READY_CACHE_SECONDS: "30"
+
+  # --- Helm ---
+  HELM_TIMEOUT_SECONDS: "120"
+  # 策略文件的位置。它决定了**谁能回滚**，所以要改的是
+  # configmap-policy.yaml 而不是这里。
+  POLICY_PATH: "/etc/k8s-ops-api/policy.yaml"
+  # 审计刻意只走 stdout 的结构化日志（event=audit，见 app/audit.py）。
+  # 不设置 AUDIT_LOG_PATH：emptyDir 上的 audit.jsonl 会随 Pod 重启一起消失，
+  # 对"事后追责"没有任何价值，反而让人以为有持久记录。
+  # 若你的集群没有日志采集器，再挂 PVC 并设 AUDIT_LOG_PATH —— 这一步不要省。

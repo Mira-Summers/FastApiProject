@@ -16,7 +16,12 @@ from typing import Iterator
 
 import pytest
 
-from app.audit import AuditError, AuditLogger
+from app.audit import (
+    AUDIT_OUTCOME_ATTEMPTED,
+    AuditError,
+    AuditEvent,
+    AuditLogger,
+)
 from app.config import Settings
 from app.helm.runner import HelmResult
 from app.main import create_app
@@ -120,16 +125,26 @@ def test_audit_record_has_a_closed_set_of_fields(make_client, helm_runner, audit
         assert set(event["actor"]) == {"username", "uid", "groups", "method"}
 
 
-def test_actor_is_anonymous_until_auth_exists(make_client, helm_runner, audit_path):
-    """Phase 3 之前没有认证层。宁可如实记 anonymous，也不能假装有身份。"""
+def test_actor_is_the_authenticated_identity(make_client, helm_runner, audit_path):
+    """审计里的 actor 必须是**通过认证的那张身份**，而不是匿名的占位值。
+
+    这条链路的每一环都可能断掉：认证器解析出了身份、守卫把它返回了、
+    路由把它传给了审计事件。任何一环漏掉，审计就会退化成「有人回滚了」
+    这种毫无用处的记录。
+    """
+    from tests.conftest import TEST_USERNAME
+
     helm_runner._result = HelmResult(0, "ok", "")
 
     with make_client(AUDIT_LOG_PATH=str(audit_path)) as client:
         client.post(ROLLBACK_URL, json={"confirm": True})
 
     actor = read_events(audit_path)[0]["actor"]
-    assert actor["username"] == "anonymous"
-    assert actor["method"] == "none"
+    assert actor["username"] == TEST_USERNAME
+    assert actor["method"] == "tokenreview"
+    # 字段是封闭集合：审计里不允许出现任何计划外的键，否则很容易在某次改动中
+    # 「顺手」把凭据或原始 TokenReview 响应塞进来，而且不会有任何东西报警。
+    assert set(actor) == {"username", "uid", "groups", "method"}
 
 
 def test_audit_request_id_matches_the_response_header(make_client, helm_runner, audit_path):
@@ -174,21 +189,43 @@ def test_audit_write_failure_does_not_break_the_rollback(make_client, helm_runne
     assert response.status_code == 200
 
 
-def test_newline_in_release_name_cannot_forge_an_audit_line(make_client, helm_runner, audit_path):
-    """JSON 编码本身就是防注入手段：换行会被转义，不会伪造出额外一行。"""
-    helm_runner._result = HelmResult(0, "ok", "")
+def test_newline_in_release_name_never_reaches_the_audit_file(make_client, audit_path):
+    """带换行的 release 名在守卫处就被拒掉，压根进不了审计。
 
+    「JSONL 里的换行必须被转义」这条性质由下面的
+    `test_newline_in_a_resource_value_cannot_forge_an_audit_line` 直接覆盖；
+    这里断言的是更前面的一道防线：非法名字不会变成审计记录里的一个字段，
+    因此也就不存在「先落库再清理」的机会。
+    """
     with make_client(AUDIT_LOG_PATH=str(audit_path)) as client:
         response = client.post(
             "/api/v1/namespaces/default/helm/releases/web%0Afake/rollback",
             json={"confirm": True},
         )
 
-    # 名字非法，应该在真正执行 helm 之前就被拒掉。
     assert response.status_code == 400
-    lines = audit_path.read_text(encoding="utf-8").splitlines()
-    assert len([line for line in lines if line]) == 2
-    assert read_events(audit_path)[0]["resource"]["release"] == "web\nfake"
+    assert read_events(audit_path) == []
+
+
+def test_newline_in_a_resource_value_cannot_forge_an_audit_line(audit_path):
+    """JSON 编码本身就是防注入手段：换行会被转义，不会伪造出额外一行。
+
+    只要 resource 里有可能来自外部的值（release 名、Pod 名、调用方传入的
+    任意字符串），这个性质就必须成立——审计文件一旦能被伪造行，
+    「谁回滚了什么」就不再可信。
+    """
+    logger = AuditLogger(str(audit_path))
+    logger.record(
+        AuditEvent(
+            action="helm.rollback",
+            outcome=AUDIT_OUTCOME_ATTEMPTED,
+            resource={"release": "web\nfake"},
+        )
+    )
+
+    lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["resource"]["release"] == "web\nfake"
 
 
 def test_audit_goes_to_the_structured_log_when_no_path_is_configured():
@@ -196,8 +233,6 @@ def test_audit_goes_to_the_structured_log_when_no_path_is_configured():
 
     日志这一行才是主记录（`event=audit` 让采集器能单独过滤），文件是补充。
     """
-    from app.audit import AUDIT_OUTCOME_ATTEMPTED, AuditEvent
-
     audit = AuditLogger(None)
 
     with capture_app_logs("app.audit") as records:

@@ -52,10 +52,20 @@ class OpsError(Exception):
     status_code: int = 500
     code: str = "internal_error"
 
-    def __init__(self, message: str, *, detail: Any = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        detail: Any = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.detail = detail
+        # 少数错误需要附加响应头，典型的是 401 的 WWW-Authenticate：
+        # RFC 6750 要求 Bearer 认证失败时必须带这个头，客户端（含 kubectl 插件、
+        # 各类 SDK）靠它判断该用哪种凭据重试。少了它，调用方只能靠猜。
+        self.headers = headers
 
 
 class BadRequest(OpsError):
@@ -163,7 +173,9 @@ def register_exception_handlers(app: FastAPI) -> None:
                     "detail": exc.detail,
                 },
             )
-        return _error_response(exc.status_code, exc.code, exc.message, exc.detail)
+        return _error_response(
+            exc.status_code, exc.code, exc.message, exc.detail, headers=exc.headers
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(

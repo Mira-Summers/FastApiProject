@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-ops-api
+  namespace: k8s-ops-api
+  labels:
+    app.kubernetes.io/name: k8s-ops-api
+    app.kubernetes.io/component: api
+spec:
+  # 单副本是有意的，不是还没调：
+  #   - prometheus_client 的默认 registry 是进程内的（这也是 Dockerfile 里
+  #     --workers 1 的原因）。多副本会让 /metrics 变成几条互不相干的曲线，
+  #     要正确聚合得给 Prometheus 配 PodMonitor 逐 Pod 抓取；
+  #   - TokenReview 的身份缓存、就绪状态缓存、审计器都是进程内的状态。
+  # 要扩副本，先把上面两件事解决掉，别直接改这个数字。
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 这个服务同时只能有一个活跃实例在做审计与缓存，但它无状态可共享，
+      # 所以 maxSurge 1 / maxUnavailable 0 就能做到不中断发布。
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-ops-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k8s-ops-api
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: k8s-ops-api
+      automountServiceAccountToken: true
+
+      # 一次 helm 回滚最长可能占用 HELM_TIMEOUT_SECONDS（120 秒）。
+      # 给足余量，否则 kubelet 会在回滚执行到一半时 SIGKILL ——
+      # release 停在半完成状态（可能是 pending-rollback），
+      # 而审计里只留下一条 attempted，事后完全说不清。
+      terminationGracePeriodSeconds: 150
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # fsGroup 是下面两个 emptyDir 能被非 root 写入的原因，必须和
+        # Dockerfile 里 opsapi 用户的 gid（1000）一致。
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: api
+          image: k8s-ops-api:2.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: k8s-ops-api-config
+
+          # ★ 存活探针走 /health/live，它**不碰集群**。
+          #   这是本清单里最容易配错的一处：如果拿 /health/ready 当存活探针，
+          #   API Server 抖一下或 SA 权限被改，kubelet 就会把所有 Pod 一起杀掉 ——
+          #   上游的短暂故障被放大成一次全量重启。
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # 启动探针只做一件事：在进程真正起来之前压住上面两个探针。
+          # 挂载策略 ConfigMap、加载策略文件失败都会让进程直接退出，
+          # 那种情况不该被记成"存活探针失败"。
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 30
+
+          # ★ 就绪探针走 /health/ready，它会真打一次 API Server（结果缓存
+          #   K8S_READY_CACHE_SECONDS 秒，失败结果也缓存）。
+          #   timeoutSeconds 必须 ≥ 配置里的 K8S_REQUEST_TIMEOUT_SECONDS（10 秒），
+          #   否则 API Server 只是慢一点就会被判成不健康，Pod 反复摘挂。
+          #   集群真的挂了时，Pod 会在 failureThreshold × periodSeconds 之后
+          #   从 Endpoints 摘除 —— 这是对的：连不上集群时本服务确实做不了任何事。
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # 只限内存，不限 CPU。CPU 上限会导致限流（throttling），
+              # 对一个要等 helm 子进程、还要处理日志流的接口来说，
+              # 让它偶尔跑满比被限流更划算。内存必须限死，否则 OOM 会拖垮节点。
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            # 根文件系统只读。本服务不写任何本地文件——审计走 stdout，
+            # helm 的状态写进下面单独挂的 emptyDir。这条能挡住
+            # "被攻破后往镜像里塞文件 / 改自己的代码" 这一整类动作。
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/k8s-ops-api
+              readOnly: true
+            # helm 3 按 XDG 规范把 cache/config/data 放在 $HOME 下
+            # （Dockerfile 里显式钉了 HELM_CACHE_HOME 等三个变量）。
+            # 根文件系统只读，所以这里必须给一个可写的挂载点，
+            # 否则 helm 会因为写不进缓存而失败。
+            - name: helm-home
+              mountPath: /home/opsapi
+            # 根文件系统只读之后 /tmp 也需要挂出来：Python 的 tempfile、
+            # helm 的临时文件都往这写。
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # 整个目录挂载，不用 subPath：subPath 挂载不会随 ConfigMap 更新而刷新，
+        # 是个很常见的坑。这里按目录挂，语义更直白。
+        - name: policy
+          configMap:
+            name: k8s-ops-api-policy
+        - name: helm-home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

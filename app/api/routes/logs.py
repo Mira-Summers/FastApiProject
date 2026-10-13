@@ -15,6 +15,8 @@ from app.k8s.client import CoreV1ApiLike
 from app.k8s.logs import read_pod_logs
 from app.schemas.errors import COMMON_ERROR_RESPONSES
 from app.schemas.logs import LogResponse
+from app.security.guards import require_pod_logs
+from app.security.identity import Identity
 
 router = APIRouter(
     prefix="/api/v1/namespaces/{namespace}/pods",
@@ -23,10 +25,20 @@ router = APIRouter(
 )
 
 
-@router.get("/{pod_name}/logs", response_model=LogResponse, summary="读取 Pod 日志")
+@router.get(
+    "/{pod_name}/logs",
+    response_model=LogResponse,
+    summary="读取 Pod 日志",
+    description=(
+        "需要调用方具备该 namespace 的 `get pods/log` 权限。\n\n"
+        "`pods/log` 是独立子资源，在 RBAC 里可以单独授予——"
+        "「能看 Pod 状态但不能看日志」是常见且合理的配置。"
+    ),
+)
 def get_pod_logs(
     namespace: str,
     pod_name: str,
+    _identity: Identity = Depends(require_pod_logs),
     container: Optional[str] = Query(None, description="容器名；不传则用 Pod 的默认容器"),
     tail_lines: Optional[int] = Query(
         200, ge=1, le=10000, description="只返回末尾这么多行"

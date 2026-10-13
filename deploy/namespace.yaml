@@ -1,0 +1,18 @@
+# 本服务自己的命名空间。
+#
+# 挂 PSA 标签是这份清单里唯一一处「准入控制」：
+# restricted 会拒绝 privileged、hostPath、以及没配 seccompProfile / 没 drop 全部
+# capabilities 的 Pod。它和 deployment.yaml 里的 securityContext 是配套的——
+# 少写一项，Pod 会被直接拒绝创建，而不是带着多余的权限跑起来。
+#
+# 注意：PSA 的 enforce-version: latest 意味着集群升级后判定标准会跟着变。
+# 如果你的集群升级节奏和业务不同步，钉死版本（如 v1.30）比 latest 可控。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-ops-api
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
